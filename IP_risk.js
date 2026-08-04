@@ -1,10 +1,16 @@
 /**
- * IP 归属地 + iprisk 风险检测 (v3 最大兼容版)
- * 源顺序: ip.sb → ipapi.co → ip-api.com → ipinfo.io
+ * IP 归属地 + 综合风控检测 (v5 最终版)
+ * 
+ * 效果: 结合 ip-api (查机房/家宽) + AbuseIPDB (查真实风控百分比)
+ * 标签示例: [极品·家宽] 🇺🇸 US | 原始名称 / [优质·机房0%] 🇯🇵 JP | ...
+ * 
+ * 参数: 
+ * abuseKey=你的AbuseIPDB_Key
+ * cache=true
  */
 async function operator(proxies = [], targetPlatform, context) {
     const $ = $substore;
-    const { cache = true } = $arguments || {};
+    const { cache = true, abuseKey = '' } = $arguments || {};
 
     const EMOJI = (code) => {
         if (!code || code.length !== 2) return '🏳️';
@@ -13,59 +19,58 @@ async function operator(proxies = [], targetPlatform, context) {
         } catch (e) { return '🏳️'; }
     };
     const parse = (b) => { try { return JSON.parse(b); } catch (e) { return null; } };
-    const dcTest = (org) => /cloudflare|cloudfront|amazon|aws|google|microsoft|azure|digitalocean|vultr|linode|oracle|ovh|hetzner|hosting|server|cloud|cdn|datacenter/.test(String(org || '').toLowerCase());
-
-    // 源1: ip.sb (HTTPS, 免Key)
-    async function srcIpSb(s) {
-        const { statusCode, body } = await $.http.get(`https://api.ip.sb/geoip/${s}`);
-        if (statusCode !== 200) throw new Error(`ip.sb 状态码 ${statusCode}`);
-        const d = parse(body);
-        if (!d || !d.country_code) throw new Error('ip.sb 返回异常');
-        return { cc: d.country_code, score: dcTest(d.organization) ? 30 : 0, source: 'ip.sb' };
-    }
-    // 源2: ipapi.co (HTTPS, 免Key)
-    async function srcIpapiCo(s) {
-        const { statusCode, body } = await $.http.get(`https://ipapi.co/${s}/json/`);
-        if (statusCode !== 200) throw new Error(`ipapi.co 状态码 ${statusCode}`);
-        const d = parse(body);
-        if (!d || d.error) throw new Error('ipapi.co 返回异常');
-        return { cc: d.country_code, score: dcTest(d.org) ? 30 : 0, source: 'ipapi.co' };
-    }
-    // 源3: ip-api.com (唯一带 proxy/hosting 风险标记的免费源)
-    async function srcIpApi(s) {
-        const { statusCode, body } = await $.http.get(`http://ip-api.com/json/${s}?fields=status,countryCode,proxy,hosting,mobile`);
-        if (statusCode !== 200) throw new Error(`ip-api 状态码 ${statusCode}`);
-        const d = parse(body);
-        if (!d || d.status !== 'success') throw new Error('ip-api 返回异常');
-        let score = 0;
-        if (d.hosting) score += 30;
-        if (d.proxy) score += 40;
-        if (d.mobile) score += 10;
-        return { cc: d.countryCode, score, source: 'ip-api' };
-    }
-    // 源4: ipinfo.io 兜底
-    async function srcIpinfo(s) {
-        const { statusCode, body } = await $.http.get(`https://ipinfo.io/${s}/json`);
-        if (statusCode !== 200) throw new Error(`ipinfo 状态码 ${statusCode}`);
-        const d = parse(body);
-        if (!d || !d.country) throw new Error('ipinfo 返回异常');
-        return { cc: d.country, score: dcTest(d.org) ? 30 : 0, source: 'ipinfo' };
-    }
 
     async function queryServer(server) {
-        for (const fn of [srcIpSb, srcIpapiCo, srcIpApi, srcIpinfo]) {
+        let cc = 'UN', isHosting = false, isProxy = false, riskScore = 0;
+        
+        // 1. 查 ip-api 拿基础属性 (国家、是否机房、是否代理)
+        try {
+            const { statusCode, body } = await $.http.get(`http://ip-api.com/json/${server}?fields=status,countryCode,proxy,hosting,mobile`);
+            if (statusCode === 200) {
+                const d = parse(body);
+                if (d && d.status === 'success') {
+                    cc = d.countryCode;
+                    isHosting = d.hosting; // 机房/数据中心
+                    isProxy = d.proxy;     // 代理/VPN
+                }
+            }
+        } catch(e) { $.info(`[${server}] ip-api 失败: ${e.message || e}`); }
+
+        // 2. 查 AbuseIPDB 拿真实风控分 (0-100)
+        if (abuseKey) {
             try {
-                const info = await fn(server);
-                info.score = Math.min(info.score, 100);
-                info.tag = `[风险${info.score}%]`;
-                $.info(`[${server}] 成功 (源: ${info.source}) ${info.cc} 风险${info.score}%`);
-                return info;
-            } catch (e) {
-                $.info(`[${server}] ${fn.name} 失败: ${e.message || e}`);
+                const { statusCode, body } = await $.http.get({
+                    url: `https://api.abuseipdb.com/api/v2/check?ip=${server}`,
+                    headers: { Key: abuseKey, Accept: 'application/json' },
+                });
+                if (statusCode === 200) {
+                    const d = parse(body);
+                    if (d && d.data) {
+                        riskScore = d.data.abuseConfidencePercentage ?? 0;
+                    }
+                }
+            } catch(e) { $.info(`[${server}] AbuseIPDB 失败: ${e.message || e}`); }
+        }
+
+        // 3. 生成类似 ping0 的综合标签
+        let tag = '';
+        if (riskScore > 50) {
+            tag = `[高危${riskScore}%]`;
+        } else if (riskScore > 10) {
+            tag = `[风控${riskScore}%]`;
+        } else {
+            // 低风险情况，区分线路质量 (这是 ping0 的精髓)
+            if (!isHosting && !isProxy) {
+                tag = '[极品·家宽]'; // 住宅IP，最稀有，解锁最好
+            } else if (isHosting) {
+                tag = `[优质·机房${riskScore}%]`; // 干净机房
+            } else {
+                tag = `[风控${riskScore}%]`;
             }
         }
-        $.error(`[${server}] 四源全灭`);
-        return null;
+
+        $.info(`[${server}] 综合结果: ${cc} | ${tag}`);
+        return { cc, tag, score: riskScore };
     }
 
     const uniqueServers = [...new Set(proxies.map((p) => p.server).filter(Boolean))];
@@ -73,7 +78,7 @@ async function operator(proxies = [], targetPlatform, context) {
     const toQuery = [];
     for (const server of uniqueServers) {
         const cached = cache && typeof scriptResourceCache !== 'undefined'
-            ? scriptResourceCache.get(`ip_info_v3_${server}`) : null;
+            ? scriptResourceCache.get(`ip_info_v5_${server}`) : null;
         if (cached) infoMap[server] = JSON.parse(cached);
         else toQuery.push(server);
     }
@@ -87,7 +92,7 @@ async function operator(proxies = [], targetPlatform, context) {
                 if (info) {
                     infoMap[server] = info;
                     if (cache && typeof scriptResourceCache !== 'undefined') {
-                        scriptResourceCache.set(`ip_info_v3_${server}`, JSON.stringify(info));
+                        scriptResourceCache.set(`ip_info_v5_${server}`, JSON.stringify(info));
                     }
                 }
             }));
