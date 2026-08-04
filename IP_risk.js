@@ -1,7 +1,7 @@
 /**
- * IP 归属地 + 综合风控检测 (v5 最终版)
+ * IP 归属地 + 综合风控检测 (v6 纯净版)
  * 
- * 效果: 结合 ip-api (查机房/家宽) + AbuseIPDB (查真实风控百分比)
+ * 唯一数据源: AbuseIPDB (提供真实风控分 + 国家 + 线路用途)
  * 标签示例: [极品·家宽] 🇺🇸 US | 原始名称 / [优质·机房0%] 🇯🇵 JP | ...
  * 
  * 参数: 
@@ -12,6 +12,10 @@ async function operator(proxies = [], targetPlatform, context) {
     const $ = $substore;
     const { cache = true, abuseKey = '' } = $arguments || {};
 
+    if (!abuseKey) {
+        throw new Error('请在脚本参数中配置 abuseKey (你的 AbuseIPDB API Key)');
+    }
+
     const EMOJI = (code) => {
         if (!code || code.length !== 2) return '🏳️';
         try {
@@ -20,89 +24,95 @@ async function operator(proxies = [], targetPlatform, context) {
     };
     const parse = (b) => { try { return JSON.parse(b); } catch (e) { return null; } };
 
-    async function queryServer(server) {
-        let cc = 'UN', isHosting = false, isProxy = false, riskScore = 0;
-        
-        // 1. 查 ip-api 拿基础属性 (国家、是否机房、是否代理)
-        try {
-            const { statusCode, body } = await $.http.get(`http://ip-api.com/json/${server}?fields=status,countryCode,proxy,hosting,mobile`);
-            if (statusCode === 200) {
-                const d = parse(body);
-                if (d && d.status === 'success') {
-                    cc = d.countryCode;
-                    isHosting = d.hosting; // 机房/数据中心
-                    isProxy = d.proxy;     // 代理/VPN
-                }
-            }
-        } catch(e) { $.info(`[${server}] ip-api 失败: ${e.message || e}`); }
+    async function queryAbuseIPDB(server) {
+        const url = `https://api.abuseipdb.com/api/v2/check?ipAddress=${encodeURIComponent(server)}`;
+        const { statusCode, body } = await $.http.get({
+            url,
+            headers: { 
+                Key: abuseKey, 
+                Accept: 'application/json' 
+            },
+        });
 
-        // 2. 查 AbuseIPDB 拿真实风控分 (0-100)
-        if (abuseKey) {
-            try {
-                const { statusCode, body } = await $.http.get({
-                    url: `https://api.abuseipdb.com/api/v2/check?ip=${server}`,
-                    headers: { Key: abuseKey, Accept: 'application/json' },
-                });
-                if (statusCode === 200) {
-                    const d = parse(body);
-                    if (d && d.data) {
-                        riskScore = d.data.abuseConfidencePercentage ?? 0;
-                    }
-                }
-            } catch(e) { $.info(`[${server}] AbuseIPDB 失败: ${e.message || e}`); }
+        if (statusCode !== 200) {
+            throw new Error(`状态码 ${statusCode}, 响应: ${String(body).slice(0, 100)}`);
         }
 
-        // 3. 生成类似 ping0 的综合标签
+        const d = parse(body);
+        if (!d || !d.data) {
+            throw new Error('返回数据格式异常');
+        }
+
+        const data = d.data;
+        const score = data.abuseConfidenceScore ?? 0;
+        const cc = data.countryCode || 'UN';
+        const usageType = (data.usageType || '').toLowerCase();
+        const isp = (data.isp || '').toLowerCase();
+
         let tag = '';
-        if (riskScore > 50) {
-            tag = `[高危${riskScore}%]`;
-        } else if (riskScore > 10) {
-            tag = `[风控${riskScore}%]`;
+        
+        // 通过 usageType 和 isp 智能识别线路质量
+        const isResidential = /fixed line|cable|dsl|residential/.test(usageType) || /residential/.test(isp);
+        const isDataCenter = /data center|hosting|transit|cdn|content delivery/.test(usageType);
+
+        // 生成综合标签
+        if (score > 50) {
+            tag = `[高危${score}%]`;
+        } else if (score > 10) {
+            tag = `[风控${score}%]`;
         } else {
             // 低风险情况，区分线路质量 (这是 ping0 的精髓)
-            if (!isHosting && !isProxy) {
+            if (isResidential) {
                 tag = '[极品·家宽]'; // 住宅IP，最稀有，解锁最好
-            } else if (isHosting) {
-                tag = `[优质·机房${riskScore}%]`; // 干净机房
+            } else if (isDataCenter) {
+                tag = `[优质·机房${score}%]`; // 干净机房
             } else {
-                tag = `[风控${riskScore}%]`;
+                tag = `[普通${score}%]`;
             }
         }
 
-        $.info(`[${server}] 综合结果: ${cc} | ${tag}`);
-        return { cc, tag, score: riskScore };
+        return { cc, tag };
     }
 
     const uniqueServers = [...new Set(proxies.map((p) => p.server).filter(Boolean))];
     const infoMap = {};
     const toQuery = [];
+
     for (const server of uniqueServers) {
         const cached = cache && typeof scriptResourceCache !== 'undefined'
-            ? scriptResourceCache.get(`ip_info_v5_${server}`) : null;
-        if (cached) infoMap[server] = JSON.parse(cached);
-        else toQuery.push(server);
+            ? scriptResourceCache.get(`ip_abuse_v6_${server}`) 
+            : null;
+        if (cached) {
+            infoMap[server] = JSON.parse(cached);
+        } else {
+            toQuery.push(server);
+        }
     }
 
     if (toQuery.length > 0) {
-        $.info(`需查询 ${toQuery.length} 个独立 IP...`);
-        for (let i = 0; i < toQuery.length; i += 5) {
-            const chunk = toQuery.slice(i, i + 5);
-            await Promise.all(chunk.map(async (server) => {
-                const info = await queryServer(server);
-                if (info) {
-                    infoMap[server] = info;
-                    if (cache && typeof scriptResourceCache !== 'undefined') {
-                        scriptResourceCache.set(`ip_info_v5_${server}`, JSON.stringify(info));
-                    }
+        $.info(`需查询 ${toQuery.length} 个独立 IP (AbuseIPDB)...`);
+        // AbuseIPDB 免费版限制每秒请求数，串行查询并加延迟防 429 报错
+        for (const server of toQuery) {
+            try {
+                const info = await queryAbuseIPDB(server);
+                infoMap[server] = info;
+                $.info(`[${server}] 成功: ${info.cc} ${info.tag}`);
+                if (cache && typeof scriptResourceCache !== 'undefined') {
+                    scriptResourceCache.set(`ip_abuse_v6_${server}`, JSON.stringify(info));
                 }
-            }));
-            if (i + 5 < toQuery.length) await new Promise((r) => setTimeout(r, 1200));
+            } catch (e) {
+                $.error(`[${server}] 查询失败: ${e.message || e}`);
+            }
+            // 延迟 300ms，防止触发速率限制
+            await new Promise((r) => setTimeout(r, 300)); 
         }
     }
 
     return proxies.map((p) => {
         const info = infoMap[p.server];
-        if (info) p.name = `${info.tag} ${EMOJI(info.cc)} ${info.cc} | ${p.name}`;
+        if (info) {
+            p.name = `${info.tag} ${EMOJI(info.cc)} ${info.cc} | ${p.name}`;
+        }
         return p;
     });
 }
