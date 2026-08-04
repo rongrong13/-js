@@ -1,8 +1,8 @@
 /**
- * IP 归属地 + 综合风控检测 (v6 纯净版)
+ * IP 归属地 + 综合风控检测 (v7 支持域名解析版)
  * 
  * 唯一数据源: AbuseIPDB (提供真实风控分 + 国家 + 线路用途)
- * 标签示例: [极品·家宽] 🇺🇸 US | 原始名称 / [优质·机房0%] 🇯🇵 JP | ...
+ * 新增功能: 自动识别域名，并通过 DNS 解析为真实 IP 后再查询
  * 
  * 参数: 
  * abuseKey=你的AbuseIPDB_Key
@@ -23,9 +23,42 @@ async function operator(proxies = [], targetPlatform, context) {
         } catch (e) { return '🏳️'; }
     };
     const parse = (b) => { try { return JSON.parse(b); } catch (e) { return null; } };
+    
+    // 判断是否为 IP 地址
+    const isIP = (str) => /^(\d{1,3}\.){3}\d{1,3}$/.test(str) || /:/.test(str);
+
+    // DNS 解析域名到 IP
+    async function resolveDomainToIP(domain) {
+        try {
+            const { statusCode, body } = await $.http.get(`https://dns.google/resolve?name=${encodeURIComponent(domain)}&type=A`);
+            if (statusCode === 200) {
+                const data = parse(body);
+                if (data && data.Answer) {
+                    const aRecord = data.Answer.find(a => a.type === 1); // type 1 是 A 记录 (IPv4)
+                    if (aRecord) return aRecord.data;
+                }
+            }
+        } catch (e) {
+            $.info(`[DNS] 解析 ${domain} 失败: ${e.message || e}`);
+        }
+        return null;
+    }
 
     async function queryAbuseIPDB(server) {
-        const url = `https://api.abuseipdb.com/api/v2/check?ipAddress=${encodeURIComponent(server)}`;
+        let ipToQuery = server;
+        
+        // 如果是域名，先解析
+        if (!isIP(server)) {
+            $.info(`[${server}] 是域名，正在解析真实 IP...`);
+            const resolvedIP = await resolveDomainToIP(server);
+            if (!resolvedIP) {
+                throw new Error('域名解析失败，无法获取真实 IP');
+            }
+            ipToQuery = resolvedIP;
+            $.info(`[${server}] 成功解析为 IP: ${ipToQuery}`);
+        }
+
+        const url = `https://api.abuseipdb.com/api/v2/check?ipAddress=${encodeURIComponent(ipToQuery)}`;
         const { statusCode, body } = await $.http.get({
             url,
             headers: { 
@@ -61,11 +94,10 @@ async function operator(proxies = [], targetPlatform, context) {
         } else if (score > 10) {
             tag = `[风控${score}%]`;
         } else {
-            // 低风险情况，区分线路质量 (这是 ping0 的精髓)
             if (isResidential) {
-                tag = '[极品·家宽]'; // 住宅IP，最稀有，解锁最好
+                tag = '[极品·家宽]'; 
             } else if (isDataCenter) {
-                tag = `[优质·机房${score}%]`; // 干净机房
+                tag = `[优质·机房${score}%]`; 
             } else {
                 tag = `[普通${score}%]`;
             }
@@ -80,7 +112,7 @@ async function operator(proxies = [], targetPlatform, context) {
 
     for (const server of uniqueServers) {
         const cached = cache && typeof scriptResourceCache !== 'undefined'
-            ? scriptResourceCache.get(`ip_abuse_v6_${server}`) 
+            ? scriptResourceCache.get(`ip_abuse_v7_${server}`) 
             : null;
         if (cached) {
             infoMap[server] = JSON.parse(cached);
@@ -90,20 +122,18 @@ async function operator(proxies = [], targetPlatform, context) {
     }
 
     if (toQuery.length > 0) {
-        $.info(`需查询 ${toQuery.length} 个独立 IP (AbuseIPDB)...`);
-        // AbuseIPDB 免费版限制每秒请求数，串行查询并加延迟防 429 报错
+        $.info(`需查询 ${toQuery.length} 个独立节点 (AbuseIPDB)...`);
         for (const server of toQuery) {
             try {
                 const info = await queryAbuseIPDB(server);
                 infoMap[server] = info;
                 $.info(`[${server}] 成功: ${info.cc} ${info.tag}`);
                 if (cache && typeof scriptResourceCache !== 'undefined') {
-                    scriptResourceCache.set(`ip_abuse_v6_${server}`, JSON.stringify(info));
+                    scriptResourceCache.set(`ip_abuse_v7_${server}`, JSON.stringify(info));
                 }
             } catch (e) {
                 $.error(`[${server}] 查询失败: ${e.message || e}`);
             }
-            // 延迟 300ms，防止触发速率限制
             await new Promise((r) => setTimeout(r, 300)); 
         }
     }
